@@ -81,18 +81,28 @@ def fetch(path: str) -> dict:
     if stored is not None:
         cache[path] = stored
         return stored
-    time.sleep(max(0, 2 - (time.time() - _last)))
     _last = time.time()
     r = client.get(path)
     r.raise_for_status()
-    cache[path] = r.json()
+    try:
+        cache[path] = r.json()
+    except ValueError:
+        # Unknown paths serve the single-page app's HTML shell with a 200,
+        # so raise_for_status lets them through and only the decode fails.
+        raise RuntimeError(
+            f"JiuJitsu.net served HTML rather than JSON for {path}, which "
+            f"usually means the path is wrong") from None
     _disk_put(path, cache[path])
     return cache[path]
 
 
-def _trim_athlete(raw: dict) -> dict:
+def _trim_athlete(raw: dict, gi: bool) -> dict:
     athlete = raw.get("athlete", {})
     result = {
+        # Stamped from the request: medal records carry no ruleset of their
+        # own, so two profiles for the same athlete are otherwise identical
+        # in shape and impossible to tell apart once separated.
+        "gi": gi,
         "name": athlete.get("name"),
         "belt": athlete.get("belt"),
         "team": athlete.get("team_name"),
@@ -141,6 +151,7 @@ def _trim_match(m: dict, athlete_id: str) -> dict:
         "opponent_rating_before": m.get(f"{opp}StartRating"),
         "athlete_rating_change": end - start if start is not None and end is not None else None,
         "submission": bool(m.get("submission")),
+        "videoLink": m.get("videoLink")
     }
 
 def _trim_ranking(r: dict) -> dict:
@@ -166,6 +177,73 @@ def _trim_ranking(r: dict) -> dict:
         ]
     return result
 
+def _trim_competitor(c: dict) -> dict:
+    result = {
+        "seed": c.get("seed"),
+        "name": c.get("name"),
+        "personal_name": c.get("personal_name"),
+        "slug": c.get("slug"),
+        "athlete_id": c.get("id"),
+        "team": c.get("team"),
+        "country": c.get("country"),
+        "rating": round(c["rating"]) if c.get("rating") is not None else None,
+        "rank": c.get("rank"),
+        "percentile": round(c["percentile"] * 100, 1)
+        if c.get("percentile") is not None else None,
+        "matches": c.get("match_count"),
+    }
+    if c.get("next_when") or c.get("next_where"):
+        result["next_match"] = {"when": c.get("next_when"),
+                                "where": c.get("next_where")}
+    return result
+
+def _trim_corner(m: dict, side: str):
+    """One side of a bracket match: a competitor, a bye, or an empty slot.
+
+    Always a dict so the shape is predictable. Detail is deliberately thin -
+    join on slug to the competitors list rather than repeating team, country
+    and rating for every round an athlete appears in.
+    """
+    if m.get(f"{side}_bye"):
+        return {"bye": True}
+    name = m.get(f"{side}_personal_name") or m.get(f"{side}_name")
+    if not name:
+        # Slot not filled yet; next_description names the feeding match.
+        nxt = m.get(f"{side}_next_description")
+        return {"tbd": nxt} if nxt else {"tbd": None}
+    corner = {
+        "name": name,
+        "slug": m.get(f"{side}_slug"),
+        "seed": m.get(f"{side}_seed"),
+    }
+    expected = m.get(f"{side}_expected")
+    if expected is not None:
+        corner["win_probability"] = round(expected, 3)
+    if m.get(f"{side}_loser") is True:
+        corner["eliminated"] = True
+    return corner
+
+def _trim_bracket_match(m: dict) -> dict:
+    result = {
+        "match": m.get("display_match_num"),
+        "round": m.get("fight_num"),
+        "red": _trim_corner(m, "red"),
+        "blue": _trim_corner(m, "blue"),
+    }
+    if m.get("final"):
+        result["final"] = True
+    when, where = m.get("when") or None, m.get("where")
+    if when or where:
+        result["scheduled"] = {"when": when, "where": where}
+    # loser is False rather than None for a fight that simply has not
+    # happened yet, so only call a winner when one side is explicitly out.
+    red_out, blue_out = m.get("red_loser") is True, m.get("blue_loser") is True
+    if red_out != blue_out:
+        won = "blue" if red_out else "red"
+        result["winner"] = (m.get(f"{won}_personal_name")
+                            or m.get(f"{won}_name"))
+    return result
+
 
 @mcp.tool()
 def get_matches(athlete: str, gi: bool = True, page: int = 1) -> dict:
@@ -178,14 +256,21 @@ def get_matches(athlete: str, gi: bool = True, page: int = 1) -> dict:
     nothing better. Set gi=False for no-gi matches. Each match has: date, event,
     division, result (win/loss from this athlete's point of view), opponent
     name and slug, the opponent's rating before the match, this athlete's
-    rating change, and whether it ended by submission. Does NOT include the
-    opponent's team - call get_athlete with opponent_slug for that. If
-    total_pages > 1, call again with page=2, 3... to see older matches, at
+    rating change, and whether it ended by submission.
+    We also return videoLink, if present, this will be a link to the recording
+    of the match. Videos can come from 2 sources, flograppling or youtube.
+    Flograppling requires a subscribtion to watch, whereas youtube is free.
+    If videoLink is not present, there's no publicly available recording of the match.
+    Does NOT include the opponent's team - call get_athlete with opponent_slug for that.
+    If total_pages > 1, call again with page=2, 3... to see older matches, at
     one request per page.
     """
     try:
+        # Quoted with gi even though the id is the same either way, so the
+        # lookup shares a cache entry with get_athlete for this ruleset.
         athlete_id = (athlete if _UUID.match(athlete)
-                      else fetch(f"/api/athlete/{athlete}")["athlete"]["id"])
+                      else fetch(f"/api/athlete/{athlete}?gi={str(gi).lower()}"
+                                 )["athlete"]["id"])
         raw = fetch(f"/api/matches?gi={str(gi).lower()}&athlete_id={athlete_id}&page={page}")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
@@ -213,9 +298,13 @@ def search_athlete(searchparam : str) -> list[dict]:
         return {"error": f"JiuJitsu.net returned HTTP {e.response.status_code}"}
 
 @mcp.tool()
-def get_athlete(slug: str) -> dict:
+def get_athlete(slug: str, gi: bool) -> dict:
     """Get a BJJ athlete's profile from JiuJitsu.net by their URL slug
-    (e.g. "owen-patrick-shade").
+    (e.g. "owen-patrick-shade"). You can also pass a boolean into
+    the gi parameter. true will return gi information, false will
+    return no gi. If you get asked about an athlete and the user doesn't specify
+    whether they're interested in gi or no gi, call the endpoint twice and report
+    about both.
 
     Returns: current belt, team, country, instagram profile and Elo rating; rating_history, a
     dated list of rating snapshots that also records the belt and team the
@@ -228,7 +317,7 @@ def get_athlete(slug: str) -> dict:
     (1 = gold).
     """
     try:
-        return _trim_athlete(fetch(f"/api/athlete/{slug}"))
+        return _trim_athlete(fetch(f"/api/athlete/{slug}?gi={str(gi).lower()}"), gi)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return {"error": f"No athlete found with slug '{slug}'"}
@@ -291,14 +380,15 @@ def get_upcoming_events() -> dict:
     {"events":[{"id":"3239","name":"Pan IBJJF Jiu-Jitsu No-Gi Championship 2026"}]}
     """
     try:
-        return fetch(f"/api/events/bracket")
+        return fetch(f"/api/brackets/events")
     except httpx.HTTPStatusError as e:
         return {"error": f"JiuJitsu.net returned HTTP {e.response.status_code}"}
 
 @mcp.tool()
-def get_event_categories(event_id: str) -> dict:
+def get_event_categories(event_id: str, belt: str = "", age: str = "",
+                         gender: str = "", weight: str = "") -> dict:
     """
-    Get all registered categories at an event (where a category corresponds to a bracket)
+    Get the registered categories at an event (where a category corresponds to a bracket)
     using event_id from get_upcoming_events. Returns a list of categories.
     Each object in the list has the following attributes:
     age (Juvenile 1, Juvenile 2, or Adult)
@@ -306,11 +396,97 @@ def get_event_categories(event_id: str) -> dict:
     gender (male or female)
     link (used as a parameter in a later call to find the corresponding bracket)
     weight (the weight class, e.g. Light Feather)
+
+    A single event carries several hundred categories, so narrow it with the
+    optional belt, age, gender and weight filters, which match whole values
+    and ignore case. They are applied here rather than by the API, so
+    filtering is free - the request is the same either way, and repeating it
+    with different filters is served from cache. total is how many
+    categories the event has, matching is how many came back.
+
+    Pass a category's link, age, belt, gender and weight straight to
+    get_bracket to see who is in that bracket. Note that categories carry no
+    gi field, because an event is entirely gi or entirely no-gi; get_bracket
+    needs gi, so take it from the event name.
     """
     try:
-        return fetch(f"/api/brackets/categories/{quote(event_id)}")
+        raw = fetch(f"/api/brackets/categories/{quote(event_id)}")
     except httpx.HTTPStatusError as e:
         return {"error": f"JiuJitsu.net returned HTTP {e.response.status_code}"}
+    rows = all_rows = raw.get("categories", [])
+    wanted = {"belt": belt, "age": age, "gender": gender, "weight": weight}
+    for field, value in wanted.items():
+        if value:
+            rows = [c for c in rows
+                    if (c.get(field) or "").casefold() == value.casefold()]
+    # The payload's own "total" counts something wider than this event's
+    # category list, so report the length we actually hold.
+    return {
+        "categories": rows,
+        "total": len(all_rows),
+        "matching": len(rows),
+    }
+
+@mcp.tool()
+def get_bracket(
+        link: str,
+        age: str,
+        gender: str,
+        gi: bool,
+        belt: str,
+        weight: str
+) -> dict:
+    """Get the seeded competitor list for one bracket at an upcoming event.
+
+    link comes from get_event_categories and must be passed through exactly
+    as given (e.g. "/tournaments/3239/categories/2892286"). age, belt,
+    gender and weight have to match that same category record - copy them
+    across rather than retyping them, because a mismatch is rejected rather
+    than ignored. gi is NOT part of the category record: take it from the
+    event name returned by get_upcoming_events, so an event with "No-Gi" in
+    its title is gi=False and anything else is gi=True.
+
+    Returns competitors in seed order, each with: seed, name, personal_name,
+    slug, athlete_id, team, country, their current rating, world rank and
+    percentile within this division (lower is better), how many rated
+    matches they have, and next_match giving the mat and scheduled time of
+    their next fight. Pass athlete_id to get_matches, or slug to
+    get_athlete, to go deeper on any of them.
+
+    Also returns matches, the bracket itself, ordered by round. Each match
+    has its bracket number, round, scheduled time and mat, and a red and
+    blue corner. A corner is one of: a competitor, with name, slug, seed and
+    win_probability (this corner's Elo chance of winning, so the two corners
+    sum to 1, present only once both competitors are known); {"bye": true};
+    or {"tbd": "Winner of Fight 10, Mat 1"} naming the match that will fill
+    the slot. Corners carry only enough to identify the athlete - join on
+    slug to the competitors list for team, rating and rank. A decided match
+    also has winner, and the beaten corner is marked eliminated; on a
+    bracket that has not been fought yet neither appears, so absence of a
+    winner means undecided, not a draw. Costs one request.
+    """
+    # link is a path and the API wants its slashes literal, so it is quoted
+    # separately - urlencode would force them to %2F.
+    query = urlencode({
+        "age": age, "gender": gender, "gi": str(gi).lower(),
+        "belt": belt, "weight": weight,
+    }, quote_via=quote)
+    try:
+        raw = fetch(f"/api/brackets/competitors?link={quote(link, safe='/')}&{query}")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 400:
+            return {"error": "JiuJitsu.net rejected this request (HTTP 400). Check that "
+                             "age, belt, gender and weight match the get_event_categories "
+                             "record for this link, and that gi matches the event."}
+        return {"error": f"JiuJitsu.net returned HTTP {e.response.status_code}"}
+    matches = sorted(raw.get("matches", []),
+                     key=lambda m: (m.get("fight_num") or 0,
+                                    m.get("display_match_num") or 0))
+    return {
+        "division": " / ".join(p for p in (belt, age, gender, weight) if p),
+        "competitors": [_trim_competitor(c) for c in raw.get("competitors", [])],
+        "matches": [_trim_bracket_match(m) for m in matches],
+    }
 
 
 if __name__ == "__main__":
